@@ -1,4 +1,4 @@
-Bringing Rust Option<T> & Result<T, E> into C++
+# Bringing Rust Option<T> & Result<T, E> into C++
 
 ```cpp
 #include <string>
