@@ -1,291 +1,278 @@
-#pragma once
-
-#include <absl/container/flat_hash_map.h>
+#include "absl/container/flat_hash_map.h"
 
 #include "utils.hh"
 
-#include <algorithm>
-#include <cassert>
-#include <cstddef>
 #include <cstring>
-#include <initializer_list>
-#include <span>
-#include <string>
 #include <utility>
 #include <vector>
+#include <ranges>
+#include <string>
+#include <initializer_list>
 
-using TypeHandle = u32;
-using Timestamp  = i64;
+template <std::unsigned_integral T>
+[[nodiscard]] constexpr auto align_up(T value, T alignment) noexcept -> T {
+    assert(alignment != 0);
+    assert(std::has_single_bit(alignment));
 
-enum class TypeKind : u8 {
-    U64, U32, U16, U8,
-    I64, I32, I16, I8,
-    F64, F32,
-    BOOL,
-    NUM_PRIMITIVES,
-
-    STRUCT,
-};
-
-struct TypeMeta {
-    TypeKind    kind_;
-    std::string name_;
-    u32         size_;
-    u32         alignment_;
-
-    std::vector<TypeHandle> fields_;
-    std::vector<u32>        field_offsets_;
-};
-
-[[nodiscard]]
-static constexpr auto align_up(u32  value,
-                                u32  alignment) noexcept -> u32 {
-    assert(alignment != 0 && (alignment & (alignment - 1)) == 0);
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
-class TSDB;
-
-class Column {
+struct TypeHandle {
 public:
-    explicit Column(std::string name,
-                    u32         element_size,
-                    u32         capacity_hint = 0)
-        : data_()
-        , elem_size_(element_size)
-        , name_(std::move(name))
-    {
-        assert(elem_size_ > 0);
-        if (capacity_hint > 0) {
-            data_.reserve(static_cast<size_t>(elem_size_) * capacity_hint);
-        }
+    constexpr TypeHandle(u32 v) : v(v) {}
+
+    friend bool operator==(TypeHandle rhs, TypeHandle lhs) {
+        return rhs.v == lhs.v;
     }
 
-    auto append(const std::byte* __restrict__ source,
-                size_t num) -> void {
-        assert(source != nullptr);
-        const size_t byte_count = elem_size_ * num;
-        const size_t old_size   = data_.size();
-        data_.resize(old_size + byte_count);
-        std::memcpy(data_.data() + old_size, source, byte_count);
+    template <typename H>
+    friend H AbslHashValue(H h, const TypeHandle& t) {
+        return H::combine(std::move(h), t.v);
     }
 
-    [[nodiscard]] auto elem_slice(size_t start_pos,
-                                  size_t end_pos) const noexcept -> std::span<const std::byte> {
-        assert(end_pos >= start_pos);
-        assert(end_pos * elem_size_ <= data_.size());
-        return { elem_ptr(start_pos), elem_ptr(end_pos) };
-    }
-
-    [[nodiscard]] auto name()      const noexcept -> const std::string& { return name_;      }
-    [[nodiscard]] auto elem_size() const noexcept -> u32                { return elem_size_; }
-    [[nodiscard]] auto num_rows()  const noexcept -> size_t             { return data_.size() / elem_size_; }
-    [[nodiscard]] auto raw_data()  const noexcept -> const std::byte*   { return data_.data(); }
-
-private:
-    [[nodiscard]] auto elem_ptr(size_t pos) const noexcept -> const std::byte* {
-        return data_.data() + pos * elem_size_;
-    }
-
-    std::vector<std::byte> data_;
-    u32                    elem_size_;
-    std::string            name_;
+public:
+    u32 v;
 };
 
-class Table {
+class Schema {
 public:
-    explicit Table(TypeHandle type) noexcept
-        : struct_type_(type)
-    {}
+    enum class TypeKind : u8 {
+        U8, U16, U32, U64,
+        I8, I16, I32, I64,
+        F32, F64,
+        BOOL,
+        TIMESTAMP_NS,
 
-    auto insert(const std::byte* __restrict__ data,
-                const TypeMeta& meta) -> void
-    {
-        assert(data != nullptr);
-        assert(meta.kind_ == TypeKind::STRUCT);
+        NUM_PRIMITIVES,
 
-        if (columns_.empty() == true) {
-            init_columns(meta);
+        STRUCT,
+    };
+        
+    struct TypeMeta {
+        std::string name_;
+        TypeKind    kind_;
+        size_t      size_;
+        size_t      alignment_;
+
+        std::vector<TypeHandle> fields_;
+        std::vector<size_t>    field_offsets_;
+
+        static constexpr auto primitive(
+            std::string_view name,
+            TypeKind          kind,
+            size_t            size,
+            size_t            alignment
+        ) -> TypeMeta {
+            return TypeMeta{
+                .name_      = std::string{name},
+                .kind_      = kind,
+                .size_      = size,
+                .alignment_ = alignment,
+                .fields_        = {},
+                .field_offsets_ = {},
+            };
         }
 
-        for (size_t i = 0; i < meta.fields_.size(); ++i) {
-            columns_[i].append(data + meta.field_offsets_[i], 1); // append 1
+        // one level of depth TODO -> flattening
+        auto fields(std::vector<TypeMeta>& types) -> std::vector<TypeMeta> {
+            return fields_
+                | std::views::transform([&](TypeHandle& field_handle) { return types[field_handle.v]; })
+                | std::ranges::to<std::vector<TypeMeta>>();
         }
-    }
+    };
 
-    [[nodiscard]]
-    auto query_first(std::byte* __restrict__ dest,
-                     const TypeMeta& meta) const noexcept -> bool
-    {
-        if (!columns_.empty() && columns_.front().num_rows() > 0) [[likely]] {
-            return false;
-        }
-
-        const size_t n = meta.fields_.size();
-        for (size_t i = 0; i < n; ++i) {
-            auto slice = columns_[i].elem_slice(0, 1);
-            std::memcpy(dest + meta.field_offsets_[i],
-                        slice.data(),
-                        columns_[i].elem_size());
-        }
-        return true;
-    }
-
-    [[nodiscard]] auto num_rows() const noexcept -> size_t {
-        return columns_.empty() ? 0 : columns_[0].num_rows();
-    }
-
-private:
-    auto init_columns(const TypeMeta& meta) -> void {
-        columns_.reserve(meta.fields_.size());
-        for (size_t i = 0; i < meta.fields_.size(); ++i) {
-            // name = "<struct>.<field_index>"
-            columns_.emplace_back(
-                meta.name_ + "." + std::to_string(i),
-                static_cast<u32>(meta.fields_[i]),
-                0);
-        }
-    }
-
-    TypeHandle          struct_type_;
-    std::vector<Column> columns_;
-
-    friend class TSDB;
-};
-
-class TSDB {
 public:
-    explicit TSDB(size_t est_num_types = 0) {
-        types_.reserve(est_num_types + static_cast<size_t>(TypeKind::NUM_PRIMITIVES));
-        register_primitives();
+    Schema(size_t est_num_types) {
+        types_.reserve(est_num_types + std::to_underlying(TypeKind::NUM_PRIMITIVES));
+        init_primitives(types_);
     }
 
-    ~TSDB()                      = default;
-    TSDB(const TSDB&)            = delete;
-    TSDB(TSDB&&)                 = delete;
-    TSDB& operator=(const TSDB&) = delete;
-    TSDB& operator=(TSDB&&)      = delete;
+    auto register_struct(std::string name,
+                         std::initializer_list<std::pair<std::string, const TypeHandle>> fields) -> TypeHandle
+    {           
+        size_t struct_size      = 0;
+        size_t struct_alignment = 1;
 
-    [[nodiscard]] auto size_of (TypeHandle h) const noexcept -> u32      { return types_[h].size_;      }
-    [[nodiscard]] auto align_of(TypeHandle h) const noexcept -> u32      { return types_[h].alignment_; }
-    [[nodiscard]] auto type_of (TypeHandle h) const noexcept -> TypeKind { return types_[h].kind_;      }
+        std::vector<TypeHandle> struct_fields;
+        std::vector<size_t>     field_offsets;
 
-    auto register_struct(
-            std::string name,
-            std::initializer_list<std::pair<std::string, const TypeHandle>> fields)
-        -> TypeHandle
-    {
-        u32 struct_size  = 0;
-        u32 struct_align = 1;
+        for(auto&& [name, type] : fields) {
+            const TypeMeta& meta = meta_of(type);
 
-        std::vector<TypeHandle> field_types;
-        std::vector<u32>        field_offsets;
-        field_types.reserve(fields.size());
-        field_offsets.reserve(fields.size());
-
-        for (auto&& [name, type] : fields) {
-            const auto& fm = types_[type];
-            struct_align = std::max(struct_align, fm.alignment_);
-            struct_size  = align_up(struct_size, fm.alignment_);
+            struct_alignment = std::max(struct_alignment, meta.alignment_);
+            struct_size      = align_up(struct_size     , meta.alignment_);
 
             field_offsets.push_back(struct_size);
-            struct_size += fm.size_;
-            field_types.push_back(type);
+            struct_size += meta.size_;
+            struct_fields.push_back(type);
         }
 
-        struct_size = align_up(struct_size, struct_align);
+        struct_size = align_up(struct_size, struct_alignment);
 
-        const auto handle = static_cast<TypeHandle>(types_.size());
+        const TypeHandle handle = types_.size();
 
-        types_.push_back(TypeMeta{
-            .kind_          = TypeKind::STRUCT,
+        types_.push_back(TypeMeta {
             .name_          = std::move(name),
+            .kind_          = TypeKind::STRUCT,
             .size_          = struct_size,
-            .alignment_     = struct_align,
-            .fields_        = std::move(field_types),
+            .alignment_     = struct_alignment,
+            .fields_        = std::move(struct_fields),
             .field_offsets_ = std::move(field_offsets),
         });
 
         return handle;
     }
 
-    template<typename T>
-    auto insert(T val, TypeHandle type) -> void {
-        assert(type_of(type) == TypeKind::STRUCT);
-        assert(sizeof(T) == size_of(type));
-
-        const auto& meta = types_[type];
-        Table& table     = get_or_create_table(type);
-
-        if (table.columns_.empty() == true) [[unlikely]] {
-            table.columns_.reserve(meta.fields_.size());
-            for (size_t i = 0; i < meta.fields_.size(); ++i) {
-                table.columns_.emplace_back(
-                    meta.name_ + "." + std::to_string(i),
-                    types_[meta.fields_[i]].size_);
-            }
-        }
-
-        const auto* raw = reinterpret_cast<const std::byte*>(&val);
-        const size_t n   = meta.fields_.size();
-        for (size_t i = 0; i < n; ++i) {
-            table.columns_[i].append(raw + meta.field_offsets_[i], 1); // num = 1
-        }
-    }
-
-    template<typename T>
-    auto query_first(T& dest, TypeHandle type) const -> void {
-        assert(sizeof(T) == size_of(type));
-
-        const auto&  meta  = types_[type];
-        const Table& table = tables_.at(type);
-
-        assert(table.num_rows() > 0);
-
-        auto* raw      = reinterpret_cast<std::byte*>(&dest);
-        const size_t n = meta.fields_.size();
-        for (size_t i = 0; i < n; ++i) {
-            auto slice = table.columns_[i].elem_slice(0, 1);
-            std::memcpy(raw + meta.field_offsets_[i],
-                        slice.data(),
-                        table.columns_[i].elem_size());
-        }
-    }
-
-    static constexpr TypeHandle U64  = 0;
-    static constexpr TypeHandle U32  = 1;
-    static constexpr TypeHandle U16  = 2;
-    static constexpr TypeHandle U8   = 3;
-    static constexpr TypeHandle I64  = 4;
-    static constexpr TypeHandle I32  = 5;
-    static constexpr TypeHandle I16  = 6;
-    static constexpr TypeHandle I8   = 7;
-    static constexpr TypeHandle F64  = 8;
-    static constexpr TypeHandle F32  = 9;
-    static constexpr TypeHandle BOOL = 10;
+    [[nodiscard]] inline auto meta_of (const TypeHandle& type) const -> const TypeMeta& { return types_[type.v];           }
+    [[nodiscard]] inline auto kind_of (const TypeHandle& type) const -> const TypeKind& { return meta_of(type).kind_;      }
+    [[nodiscard]] inline auto size_of (const TypeHandle& type) const -> const size_t&   { return meta_of(type).size_;      }
+    [[nodiscard]] inline auto align_of(const TypeHandle& type) const -> const size_t&   { return meta_of(type).alignment_; }
 
 private:
-    auto get_or_create_table(TypeHandle type) -> Table& {
-        auto [it, inserted] = tables_.try_emplace(type, type);
-        return it->second;
+    auto init_primitives(std::vector<TypeMeta>& types) -> void {
+        constexpr std::array<TypeMeta, std::to_underlying(TypeKind::NUM_PRIMITIVES)>
+        primitives {{
+            TypeMeta::primitive("u8",  TypeKind::U8,  1, 1),
+            TypeMeta::primitive("u16", TypeKind::U16, 2, 2),
+            TypeMeta::primitive("u32", TypeKind::U32, 4, 4),
+            TypeMeta::primitive("u64", TypeKind::U64, 8, 8),
+
+            TypeMeta::primitive("i8",  TypeKind::I8,  1, 1),
+            TypeMeta::primitive("i16", TypeKind::I16, 2, 2),
+            TypeMeta::primitive("i32", TypeKind::I32, 4, 4),
+            TypeMeta::primitive("i64", TypeKind::I64, 8, 8),
+
+            TypeMeta::primitive("f32", TypeKind::F32, 4, 4),
+            TypeMeta::primitive("f64", TypeKind::F64, 8, 8),
+
+            TypeMeta::primitive("bool", TypeKind::BOOL, 1, 1),
+            TypeMeta::primitive("timestamp_ns", TypeKind::TIMESTAMP_NS, 8, 8),
+        }};
+
+        types.insert(types.end(), primitives.begin(), primitives.end());
     }
 
-    auto register_primitives() -> void {
-        types_ = {
-            { TypeKind::U64,  "u64",  8, 8, {}, {} },
-            { TypeKind::U32,  "u32",  4, 4, {}, {} },
-            { TypeKind::U16,  "u16",  2, 2, {}, {} },
-            { TypeKind::U8,   "u8",   1, 1, {}, {} },
-            { TypeKind::I64,  "i64",  8, 8, {}, {} },
-            { TypeKind::I32,  "i32",  4, 4, {}, {} },
-            { TypeKind::I16,  "i16",  2, 2, {}, {} },
-            { TypeKind::I8,   "i8",   1, 1, {}, {} },
-            { TypeKind::F64,  "f64",  8, 8, {}, {} },
-            { TypeKind::F32,  "f32",  4, 4, {}, {} },
-            { TypeKind::BOOL, "bool", 1, 1, {}, {} },
-        };
+    std::vector<TypeMeta> types_;  
+};
+
+struct Column {
+public:
+    Column() = default;
+
+    auto push(const std::byte* data, size_t size) -> void {
+        data_.insert(data_.end(), data, data + size);
     }
 
-    std::vector<TypeMeta>                  types_;
-    absl::flat_hash_map<TypeHandle, Table> tables_;
+    [[nodiscard]] auto at(size_t row, size_t elem_size) const -> const std::byte* {
+        return data_.data() + row * elem_size;
+    }
+
+    [[nodiscard]] auto row_count(size_t elem_size) const -> size_t {
+        return elem_size > 0 ? data_.size() / elem_size : 0;
+    }
+
+private:
+    std::vector<std::byte> data_;
+};
+
+struct Table {
+public:
+    Table(size_t num_columns) : columns_(num_columns) {}
+
+    auto insert_row(const std::byte* src,
+                    const std::vector<size_t>& offsets,
+                    const std::vector<size_t>& sizes) -> void
+    {
+        for (size_t i = 0; i < columns_.size(); ++i) {
+            columns_[i].push(src + offsets[i], sizes[i]);
+        }
+        ++row_count_;
+    }
+
+    auto read_row(size_t row, std::byte* dst,
+                  const std::vector<size_t>& offsets,
+                  const std::vector<size_t>& sizes) const -> void
+    {
+        for (size_t i = 0; i < columns_.size(); ++i) {
+            std::memcpy(dst + offsets[i], columns_[i].at(row, sizes[i]), sizes[i]);
+        }
+    }
+
+    [[nodiscard]] auto row_count() const -> size_t { return row_count_; }
+
+private:
+    size_t row_count_ = 0;
+    std::vector<Column> columns_;
+};
+
+class TSDB {
+public:
+    TSDB(size_t est_num_types = 1) : schema_(est_num_types) {}
+
+    ~TSDB()           = default;
+    TSDB(const TSDB&) = delete;
+    TSDB(TSDB&&)      = delete;
+
+    auto register_struct(std::string name,
+                         std::initializer_list<std::pair<std::string, const TypeHandle>> fields) -> TypeHandle
+    {
+        return schema_.register_struct(name, fields);
+    }
+
+    template<typename T>
+    auto insert(const T& src, TypeHandle type) -> void {
+        static_assert(std::is_trivially_copyable_v<T>);
+
+        Table& table = get_or_create_table(type);
+        const auto& meta = schema_.meta_of(type);
+        const auto* bytes = reinterpret_cast<const std::byte*>(&src);
+
+        auto field_sizes = get_field_sizes(meta);
+        table.insert_row(bytes, meta.field_offsets_, field_sizes);
+    }
+
+    template<typename T>
+    [[nodiscard]] auto query_first(TypeHandle type) -> T {
+        static_assert(std::is_trivially_copyable_v<T>);
+
+        Table& table = get_or_create_table(type);
+        const auto& meta = schema_.meta_of(type);
+
+        T result{};
+        if (table.row_count() == 0) return result;
+
+        auto* dst = reinterpret_cast<std::byte*>(&result);
+        auto field_sizes = get_field_sizes(meta);
+        table.read_row(0, dst, meta.field_offsets_, field_sizes);
+
+        return result;
+    }
+
+    // Default Types
+    constexpr static TypeHandle U8  = 0;
+    constexpr static TypeHandle U16 = 1;
+    constexpr static TypeHandle U32 = 2;
+    constexpr static TypeHandle U64 = 3;
+    constexpr static TypeHandle I8  = 4;
+    constexpr static TypeHandle I16 = 5;
+    constexpr static TypeHandle I32 = 6;
+    constexpr static TypeHandle I64 = 7;
+    constexpr static TypeHandle F32 = 8;   
+    constexpr static TypeHandle F64 = 9;
+    constexpr static TypeHandle TIMESTAMP_NS = 10;
+
+private:
+    [[nodiscard]] auto get_or_create_table(TypeHandle type) -> Table& {
+        const auto& meta = schema_.meta_of(type);
+        return tables_.try_emplace(type, meta.fields_.size()).first->second;
+    }   
+
+    [[nodiscard]] auto get_field_sizes(const Schema::TypeMeta& meta) const -> std::vector<size_t> {
+        return meta.fields_
+            | std::views::transform([this](auto&& field) { return schema_.size_of(field); })
+            | std::ranges::to<std::vector<size_t>>();       
+    }
+
+    Schema schema_;
+    absl::flat_hash_map<TypeHandle, Table> tables_;   
 };
