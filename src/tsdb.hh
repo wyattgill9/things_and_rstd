@@ -5,7 +5,6 @@
 #include "utils.hh"
 
 #include <cstring>
-#include <span>
 #include <utility>
 #include <vector>
 #include <string>
@@ -47,106 +46,85 @@ public:
         F32, F64,
         BOOL,
         TIMESTAMP_NS,
-
-        NUM_PRIMITIVES,
-
         STRUCT,
     };
 
-    struct TypeMeta {
-        u32       size_;
-        u32       alignment_;
-        u32       field_begin_;
-        u16       field_count_;
-        TypeKind  kind_;
-        std::byte _pad[1];
+    struct Field {
+        std::string name;
+        TypeHandle  type;
+        u32         offset = 0;
     };
-    static_assert(sizeof(TypeMeta) == 16);
 
-public:
-    Schema(size_t est_num_types) {
-        const auto prim_count = std::to_underlying(TypeKind::NUM_PRIMITIVES);
-        types_.reserve(est_num_types + prim_count);
-        type_names_.reserve(est_num_types + prim_count);
-        init_primitives();
-    }
+    struct TypeMeta {
+        std::string        name;
+        TypeKind           kind;
+        u32                size      = 0;
+        u32                alignment = 1;
+        std::vector<Field> fields;
+    };
+
+    Schema(size_t est_num_types) { init_schema(est_num_types); }
 
     auto register_struct(std::string name,
                          std::initializer_list<std::pair<std::string, const TypeHandle>> fields) -> TypeHandle
     {
-        u32 struct_size      = 0;
-        u32 struct_alignment = 1;
+        TypeMeta type {
+            .name = std::move(name),
+            .kind = TypeKind::STRUCT,
+        };
 
-        const u32 field_begin = static_cast<u32>(field_types_.size());
+        type.alignment = 8;
+        type.size      = 8;
+        type.fields.push_back({ "timestamp_ns", { static_cast<u32>(TypeKind::TIMESTAMP_NS) }, 0 });
 
-        for (auto&& [field_name, type] : fields) {
-            const TypeMeta& meta = meta_of(type);
-
-            struct_alignment = std::max(struct_alignment, meta.alignment_);
-            struct_size      = align_up(struct_size, meta.alignment_);
-
-            field_offsets_.push_back(struct_size);
-            struct_size += meta.size_;
-            field_types_.push_back(type);
-            field_names_.push_back(field_name);
+        for (auto&& [field_name, handle] : fields) {
+            const auto& ft = meta_of(handle);
+            type.alignment  = std::max(type.alignment, ft.alignment);
+            type.size       = align_up(type.size, ft.alignment);
+            type.fields.push_back({ field_name, handle, type.size });
+            type.size += ft.size;
         }
 
-        struct_size = align_up(struct_size, struct_alignment);
+        type.size = align_up(type.size, type.alignment);
 
-        const TypeHandle handle{static_cast<u32>(types_.size())};
-
-        types_.push_back(TypeMeta{
-            .size_        = struct_size,
-            .alignment_   = struct_alignment,
-            .field_begin_ = field_begin,
-            .field_count_ = static_cast<u16>(fields.size()),
-            .kind_        = TypeKind::STRUCT,
-        });
-        type_names_.push_back(std::move(name));
-
-        return handle;
+        const TypeHandle result { static_cast<u32>(types_.size()) };
+        types_.push_back(std::move(type));
+        return result;
     }
 
-    [[nodiscard]] auto meta_of (const TypeHandle& type) const -> const TypeMeta& { return types_[type.v_];           }
-    [[nodiscard]] auto name_of (const TypeHandle& type) const -> std::string_view { return type_names_[type.v_];     }
-    [[nodiscard]] auto kind_of (const TypeHandle& type) const -> TypeKind         { return meta_of(type).kind_;      }
-    [[nodiscard]] auto size_of (const TypeHandle& type) const -> size_t           { return meta_of(type).size_;      }
-    [[nodiscard]] auto align_of(const TypeHandle& type) const -> size_t           { return meta_of(type).alignment_; }
-
-    [[nodiscard]] auto field_types(const TypeHandle& type) const -> std::span<const TypeHandle> {
-        const auto& m = meta_of(type);
-        return { field_types_.data() + m.field_begin_, m.field_count_ };
-    }
-    [[nodiscard]] auto field_offsets(const TypeHandle& type) const -> std::span<const size_t> {
-        const auto& m = meta_of(type);
-        return { field_offsets_.data() + m.field_begin_, m.field_count_ };
-    }
-    [[nodiscard]] auto field_names(const TypeHandle& type) const -> std::span<const std::string> {
-        const auto& m = meta_of(type);
-        return { field_names_.data() + m.field_begin_, m.field_count_ };
-    }
+    [[nodiscard]] auto meta_of(TypeHandle h) const -> const TypeMeta&  { return types_[h.v_]; }
 
 private:
-    auto init_primitives() -> void {
-        auto add = [&](u32 size, std::string_view name) {
-            types_.push_back(TypeMeta {size, size, 0, 0, static_cast<TypeKind>(types_.size())});
-            type_names_.emplace_back(name);
+    void init_schema(size_t est_num_types) {
+        constexpr std::pair<std::string_view, TypeKind> prims[] = {
+            {"u8",  TypeKind::U8},  {"u16", TypeKind::U16}, {"u32", TypeKind::U32}, {"u64", TypeKind::U64},
+            {"i8",  TypeKind::I8},  {"i16", TypeKind::I16}, {"i32", TypeKind::I32}, {"i64", TypeKind::I64},
+            {"f32", TypeKind::F32}, {"f64", TypeKind::F64},
+            {"bool", TypeKind::BOOL},
+            {"timestamp_ns", TypeKind::TIMESTAMP_NS},
         };
-    
-        add(1, "u8" );  add(2, "u16");  add(4, "u32");  add(8, "u64");
-        add(1, "i8" );  add(2, "i16");  add(4, "i32");  add(8, "i64");
-        add(4, "f32");  add(8, "f64");
 
-        add(1, "bool");
-        add(8, "timestamp_ns");
+        constexpr u32 sizes[] = {
+            1, 2, 4, 8,
+            1, 2, 4, 8,
+            4, 8,
+            1,
+            8,
+        };
+
+        for (u32 i = 0; i < std::size(prims); ++i) {
+            types_.push_back(TypeMeta {
+                .name      = std::string(prims[i].first),
+                .kind      = prims[i].second,
+                .size      = sizes[i],
+                .alignment = sizes[i],
+            });
+        }
+
+        types_.reserve(types_.size() + est_num_types);
     }
 
-    std::vector<TypeMeta>    types_;
-    std::vector<std::string> type_names_;
-
-    std::vector<TypeHandle>  field_types_;
-    std::vector<size_t>      field_offsets_;
-    std::vector<std::string> field_names_;
+    std::vector<TypeMeta> types_;
 };
 
 struct Column {
@@ -250,7 +228,7 @@ public:
             return T{};
         }
 
-        T result{};
+        T result {};
         auto* dst = reinterpret_cast<std::byte*>(&result);
         table->read_row(0, dst);
 
@@ -258,18 +236,19 @@ public:
     }
 
     // Default Types
-    constexpr static TypeHandle U8           {std::to_underlying(Schema::TypeKind::U8)};
-    constexpr static TypeHandle U16          {std::to_underlying(Schema::TypeKind::U16)};
-    constexpr static TypeHandle U32          {std::to_underlying(Schema::TypeKind::U32)};
-    constexpr static TypeHandle U64          {std::to_underlying(Schema::TypeKind::U64)};
-    constexpr static TypeHandle I8           {std::to_underlying(Schema::TypeKind::I8)};
-    constexpr static TypeHandle I16          {std::to_underlying(Schema::TypeKind::I16)};
-    constexpr static TypeHandle I32          {std::to_underlying(Schema::TypeKind::I32)};
-    constexpr static TypeHandle I64          {std::to_underlying(Schema::TypeKind::I64)};
-    constexpr static TypeHandle F32          {std::to_underlying(Schema::TypeKind::F32)};
-    constexpr static TypeHandle F64          {std::to_underlying(Schema::TypeKind::F64)};
-    constexpr static TypeHandle BOOL         {std::to_underlying(Schema::TypeKind::BOOL)};
-    constexpr static TypeHandle TIMESTAMP_NS {std::to_underlying(Schema::TypeKind::TIMESTAMP_NS)};
+    constexpr static TypeHandle U8   { std::to_underlying(Schema::TypeKind::U8  ) };
+    constexpr static TypeHandle U16  { std::to_underlying(Schema::TypeKind::U16 ) };
+    constexpr static TypeHandle U32  { std::to_underlying(Schema::TypeKind::U32 ) };
+    constexpr static TypeHandle U64  { std::to_underlying(Schema::TypeKind::U64 ) };
+    constexpr static TypeHandle I8   { std::to_underlying(Schema::TypeKind::I8  ) };
+    constexpr static TypeHandle I16  { std::to_underlying(Schema::TypeKind::I16 ) };
+    constexpr static TypeHandle I32  { std::to_underlying(Schema::TypeKind::I32 ) };
+    constexpr static TypeHandle I64  { std::to_underlying(Schema::TypeKind::I64 ) };
+    constexpr static TypeHandle F32  { std::to_underlying(Schema::TypeKind::F32 ) };
+    constexpr static TypeHandle F64  { std::to_underlying(Schema::TypeKind::F64 ) };
+    constexpr static TypeHandle BOOL { std::to_underlying(Schema::TypeKind::BOOL) };
+
+    constexpr static TypeHandle TIME_NS { std::to_underlying(Schema::TypeKind::TIMESTAMP_NS) };
 
 private:
     [[nodiscard]] auto get_table_ptr(TypeHandle type) const -> const Table* {
@@ -279,25 +258,21 @@ private:
     }
 
     [[nodiscard]] auto get_or_create_table(TypeHandle type) -> Table& {
-        auto it = tables_.find(type);
-        if (it != tables_.end()) {
+        if (auto it = tables_.find(type); it != tables_.end()) {
             return it->second;
         }
 
-        // Amortized Table Creation
-        auto ftypes   = schema_.field_types(type);
-        auto foffsets = schema_.field_offsets(type);
+        auto&& fields = schema_.meta_of(type).fields;
 
-        std::vector<size_t> field_sizes;
-        field_sizes.reserve(ftypes.size());
-        for (auto& ft : ftypes) {
-            field_sizes.push_back(schema_.size_of(ft));
-        }
+        auto offsets = fields
+            | std::views::transform([](auto& f) { return f.offset; })
+            | std::ranges::to<std::vector<u32>>();
 
-        return tables_.emplace(type, Table{
-            std::move(field_sizes),
-            { foffsets.begin(), foffsets.end() }
-        }).first->second;
+        auto sizes = fields
+            | std::views::transform([&](auto& f) { return schema_.meta_of(f.type).size; })
+            | std::ranges::to<std::vector<size_t>>();
+
+        return tables_.emplace(type, Table {std::move(sizes), {offsets.begin(), offsets.end()}}).first->second;
     }
 
     Schema schema_;
